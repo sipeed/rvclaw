@@ -1,0 +1,9 @@
+id: app_cc_buddy
+name: CC Buddy
+version: 0.1.0
+author: taorye
+desc: Claude Code companion device — ASCII pet + permission approvals
+icon: img/icon.png
+files:
+  - app.yaml
+  - img/icon.png
