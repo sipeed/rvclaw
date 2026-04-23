@@ -93,7 +93,7 @@ async def show_error(disp, message: str = "No response", duration: float = 2.0):
     await asyncio.sleep(duration)
 
 
-def show_info_screen(disp) -> None:
+def show_info_screen(disp, wifi_speed: str | None = None) -> None:
     def _get_ip() -> str | None:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -148,6 +148,24 @@ def show_info_screen(disp) -> None:
 
     _row("Gateway", "Yes" if gw    else "No",   green if gw    else red)
     _row("Model",   model if model else "---",   white if model else gray)
+
+    if wifi_speed is not None:
+        y -= 6
+        y += 2
+        img.draw_line(12, y, DISP_W - 12, y, image.Color.from_rgb(30, 35, 60), thickness=1)
+        y += 8
+
+        speed_text = wifi_speed
+        max_w = DISP_W - 14 - 14 - 70
+        while speed_text:
+            tw, _ = image.string_size(speed_text)
+            if tw <= max_w:
+                break
+            speed_text = speed_text[:-1]
+        if speed_text != wifi_speed and len(speed_text) >= 3:
+            speed_text = speed_text[:-3] + "..."
+
+        _row("Speed", speed_text if speed_text else "---", white)
 
     disp.display(img)
     image.set_default_font(FONT_NAME)

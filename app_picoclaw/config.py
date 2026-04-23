@@ -66,6 +66,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return val.strip().lower() in {"1"}
 
 TEST_MODE = _env_bool("TEST_MODE", default=False)
+IPERF_SERVER = os.environ.get("IPERF_SERVER", "").strip()
 
 # ---------------------------------------------------------------------------
 # Agent

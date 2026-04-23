@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 
 import numpy as np
 from maix import audio, app, image
@@ -13,7 +14,7 @@ from config import (
     SPI_PORT, SPI_DC, SPI_RST, SPI_BACKLIGHT, SPI_SPEED_HZ, SPI_ROTATION,
     KEY_GPIO, BACK_KEY_GPIO, KEY_ACTIVE_LOW, KEY_DEBOUNCE_MS,
     FONT_PATH, FONT_NAME, FONT_SIZE, FONT_NAME_LARGE, FONT_SIZE_LARGE,
-    SAMPLE_RATE, AUDIO_CHANNELS, RECORDER_VOLUME, AGENT_TIMEOUT, TEST_MODE,
+    SAMPLE_RATE, AUDIO_CHANNELS, RECORDER_VOLUME, AGENT_TIMEOUT, TEST_MODE, IPERF_SERVER,
 )
 
 logger = logging.getLogger(__name__)
@@ -248,14 +249,73 @@ async def main():
         while not back_key.is_pressed() and not app.need_exit():
             await asyncio.sleep(0.05)
 
+    async def _run_wifi_speed_test() -> str:
+        if not IPERF_SERVER:
+            return "not configured"
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "iperf3", "-c", IPERF_SERVER,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as e:
+            logger.warning("iperf start failed: %s", e)
+            return "iperf unable"
+
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return "timeout"
+        except Exception as e:
+            logger.warning("iperf failed: %s", e)
+            return "failed"
+
+        output = (stdout or b"").decode("utf-8", errors="ignore") + "\n" + (stderr or b"").decode("utf-8", errors="ignore")
+        for line in reversed(output.splitlines()):
+            m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s+([KMG])bits/sec", line)
+            if m:
+                return f"{m.group(1)} {m.group(2)}bits/s"
+
+        return "parse failed"
+
     try:
         while not app.need_exit():
             if back_key.is_pressed():
-                show_info_screen(disp)
+                speed_text = None
+                speed_task = None
+                speed_updated = False
+
+                if TEST_MODE:
+                    speed_text = "testing"
+                    show_info_screen(disp, wifi_speed=speed_text)
+                    speed_task = asyncio.create_task(_run_wifi_speed_test())
+                else:
+                    show_info_screen(disp)
+
                 while back_key.is_pressed() and not app.need_exit():
                     await asyncio.sleep(0.02)
+
                 while not back_key.is_pressed() and not app.need_exit():
+                    if speed_task and speed_task.done() and not speed_updated:
+                        try:
+                            speed_text = speed_task.result()
+                        except Exception as e:
+                            logger.warning("iperf task failed: %s", e)
+                            speed_text = "failed"
+                        show_info_screen(disp, wifi_speed=speed_text)
+                        speed_updated = True
                     await asyncio.sleep(0.05)
+
+                if speed_task and not speed_task.done():
+                    speed_task.cancel()
+                    try:
+                        await speed_task
+                    except asyncio.CancelledError:
+                        pass
+
                 show_home_icon(disp)
                 while back_key.is_pressed() and not app.need_exit():
                     await asyncio.sleep(0.02)
