@@ -31,13 +31,6 @@ class Key:
         self._watch_thread = None
         self._running = False
 
-        from utils import DevMem
-        with DevMem() as dm:
-            dm.write(0x03001060, 0x00000003)
-            dm.write(0x0300192C, 0x00000044)
-            dm.write(0x03001074, 0x00000003)
-            dm.write(0x03001940, 0x00000044)
-
         self._export()
         self._set_direction(self.DIRECTION_IN)
         self._set_active_low(self.active_low)

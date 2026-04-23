@@ -61,43 +61,6 @@ class ST7789:
         if width != height and rotation in [90, 270]:
             raise ValueError(f"Invalid rotation {rotation} for {width}x{height} resolution.")
 
-        from utils import DevMem
-        with DevMem() as dm:
-            dm.write(0x03001050, 0x3)
-            dm.write(0x0300105C, 0x3)
-            dm.write(0x03001060, 0x3)
-            dm.write(0x03001054, 0x3)
-
-            dm.write(0x0300191C, 0x40)
-            dm.write(0x03001928, 0x40)
-            dm.write(0x0300192C, 0x40)
-            dm.write(0x03001920, 0x40)
-
-            dm.write(0x03001124, 0x6)
-            dm.write(0x03001128, 0x6)
-            dm.write(0x0300112C, 0x6)
-            dm.write(0x03001130, 0x6)
-
-            val = dm.read(0x03009804)
-            dm.write(0x03009804, val | 0x1)
-
-            val = dm.read(0x03009808)
-            dm.write(0x03009808, (val & ~0x1F) | 0x1)
-
-            val = dm.read(0x03009800)
-            dm.write(0x03009800, val | (1 << 2))
-
-            import time as _time; _time.sleep(0.001)
-
-            val = dm.read(0x0300907C)
-            dm.write(0x0300907C, (val & ~(0x1F << 8)) | (5 << 8))
-
-            val = dm.read(0x03009078)
-            dm.write(0x03009078, (val & ~0xFFF) | 0xF00)
-
-            dm.write(0x03009074, 0x606)
-            dm.write(0x03009070, 0x606)
-
         self._port = port
         self._spidev_bus = spidev_bus
         self._spidev_cs = spidev_cs

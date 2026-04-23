@@ -31,7 +31,6 @@ class Led:
         self._on_value_fp = None
         self._off_value_fp = None
 
-        self._setup_pinmux()
         self._setup_gpio(self.led_on_gpio)
         self._setup_gpio(self.led_off_gpio)
         self._open_value_files()
@@ -39,15 +38,6 @@ class Led:
         self.set_off()
 
         self._blink_task = None
-
-    @staticmethod
-    def _setup_pinmux() -> None:
-        from utils import DevMem
-        with DevMem() as dm:
-            dm.write(0x0300103C, 0x00000003)
-            dm.write(0x03001908, 0x00000044)
-            dm.write(0x03001068, 0x00000003)
-            dm.write(0x03001934, 0x00000044)
 
     def _setup_gpio(self, gpio_num: int) -> None:
         gpio_path = os.path.join(GPIO_BASE_PATH, f"gpio{gpio_num}")

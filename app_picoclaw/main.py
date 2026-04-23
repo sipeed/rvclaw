@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import subprocess
 
 import numpy as np
 from maix import audio, app, image
@@ -22,9 +23,19 @@ from ui import (
     start_anim, stop_anim,
     show_no_speech, show_error, show_info_screen,
     animate_speak_now, animate_transcribing, animate_thinking,
-    show_result, show_home_icon,
+    show_result, show_home_icon, show_boot_choice, show_switching,
 )
 
+PICOCLAW_INIT = "/etc/init.d/S99picoclaw_app"
+CC_BUDDY_INIT = "/opt/app_cc_buddy/S99cc_buddy_app"
+
+def _spawn_switch_to_buddy() -> None:
+    cmd = f"sleep 1 && {PICOCLAW_INIT} stop && {CC_BUDDY_INIT} start"
+    subprocess.Popen(
+        ["/bin/sh", "-c", cmd],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 # -----------------------------------------------------------------------
 # Main application
@@ -38,12 +49,37 @@ async def main():
     disp = ST7789(port=SPI_PORT, dc=SPI_DC, rst=SPI_RST, backlight=SPI_BACKLIGHT,
                   spi_speed_hz=SPI_SPEED_HZ, rotation=SPI_ROTATION)
 
-    show_home_icon(disp)
-    disp.set_backlight(1)
-
     led = Led()
     key = Key(gpio_num=KEY_GPIO, active_low=KEY_ACTIVE_LOW, debounce_ms=KEY_DEBOUNCE_MS)
     back_key = Key(gpio_num=BACK_KEY_GPIO, active_low=KEY_ACTIVE_LOW, debounce_ms=KEY_DEBOUNCE_MS)
+
+    show_boot_choice(disp)
+    disp.set_backlight(1)
+
+    if not TEST_MODE:
+        while not app.need_exit():
+            if key.is_pressed():
+                while key.is_pressed() and not app.need_exit():
+                    await asyncio.sleep(0.02)
+                break
+            if back_key.is_pressed():
+                while back_key.is_pressed() and not app.need_exit():
+                    await asyncio.sleep(0.02)
+                show_switching(disp, "Entering Buddy...")
+                _spawn_switch_to_buddy()
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    pass
+                led.close()
+                key.close()
+                back_key.close()
+                disp.turn_off()
+                return
+            await asyncio.sleep(0.05)
+
+    show_home_icon(disp)
+
     recorder = audio.Recorder(sample_rate=SAMPLE_RATE, channel=AUDIO_CHANNELS, block=False)
     recorder.volume(RECORDER_VOLUME)
     recorder.reset(True)

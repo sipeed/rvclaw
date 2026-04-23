@@ -58,6 +58,55 @@ def show_home_icon(disp) -> None:
     disp.display(_home_icon)
 
 
+def show_boot_choice(disp) -> None:
+    img = image.load(ICON_PATH)
+
+    image.set_default_font(FONT_NAME_LARGE)
+
+    blue_glow = image.Color.from_rgb(40, 140, 220)
+    blue_core = image.Color.from_rgb(125, 225, 255)
+    hot_glow = image.Color.from_rgb(180, 80, 30)
+    hot_core = image.Color.from_rgb(255, 180, 120)
+
+    y = DISP_H - 32
+    pad = 12
+
+    left = "A: Start"
+    lw, _ = image.string_size(left)
+    lx = pad
+    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        img.draw_string(lx + dx, y + dy, left, blue_glow)
+    img.draw_string(lx, y, left, blue_core)
+
+    right = "B: Buddy"
+    rw, _ = image.string_size(right)
+    rx = DISP_W - rw - pad
+    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        img.draw_string(rx + dx, y + dy, right, hot_glow)
+    img.draw_string(rx, y, right, hot_core)
+
+    image.set_default_font(FONT_NAME)
+    disp.display(img)
+
+
+def show_switching(disp, message: str) -> None:
+    img = image.Image(DISP_W, DISP_H, image.Format.FMT_RGB888)
+    img.draw_rect(0, 0, DISP_W, DISP_H, image.Color.from_rgb(8, 10, 24), thickness=-1)
+
+    image.set_default_font(FONT_NAME_LARGE)
+    tw, th = image.string_size(message)
+    img.draw_string((DISP_W - tw) // 2, (DISP_H - th) // 2,
+                    message, image.Color.from_rgb(125, 225, 255))
+
+    image.set_default_font(FONT_NAME)
+    sub = "please wait..."
+    tw2, _ = image.string_size(sub)
+    img.draw_string((DISP_W - tw2) // 2, (DISP_H + th) // 2 + 8,
+                    sub, image.Color.from_rgb(110, 110, 140))
+
+    disp.display(img)
+
+
 async def show_no_speech(disp, duration: float = 2.0):
     img = image.Image(DISP_W, DISP_H, image.Format.FMT_RGB888)
     img.draw_rect(0, 0, DISP_W, DISP_H, image.Color.from_rgb(20, 10, 10), thickness=-1)
