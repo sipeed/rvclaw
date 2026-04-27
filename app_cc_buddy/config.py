@@ -29,7 +29,7 @@ SPI_PORT = 1
 SPI_DC = "A28"
 SPI_RST = "A27"
 SPI_BACKLIGHT = "A19"
-SPI_SPEED_HZ = 50_000_000
+SPI_SPEED_HZ = 45_000_000
 SPI_ROTATION = 180
 
 # ---------------------------------------------------------------------------

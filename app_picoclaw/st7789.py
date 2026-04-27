@@ -79,13 +79,6 @@ class ST7789:
         self._dc = gpio.GPIO(dc, gpio.Mode.OUT)
         self._dc.value(0)
 
-        self._rst = None
-        if rst is not None:
-            if 0 != pinmap.set_pin_function(rst, f"GPIO{rst}"):
-                raise RuntimeError(f"Failed to set Reset pin {rst} to GPIO")
-            self._rst = gpio.GPIO(rst, gpio.Mode.OUT)
-            self.reset()
-
         self._backlight = None
         if backlight is not None:
             if 0 != pinmap.set_pin_function(backlight, f"GPIO{backlight}"):
@@ -161,26 +154,12 @@ class ST7789:
         time.sleep_ms(120)
 
         init_sequence = [
-            (ST7789_FRMCTR2, [0x1F, 0x1F, 0x00, 0x33, 0x33]),
             (ST7789_MADCTL, [{
                 0:   0x00,
                 90:  0x60,
                 180: 0xC0,
                 270: 0xA0,
             }.get(self._rotation, 0x00)]),
-            (ST7789_COLMOD, [0x05]),
-            (ST7789_GCTRL, [0x00]),
-            (ST7789_VCOMS, [0x36]),
-            (ST7789_LCMCTRL, [0x2C]),
-            (ST7789_VDVVRHEN, [0x01]),
-            (ST7789_VRHS, [0x13]),
-            (ST7789_VDVS, [0x20]),
-            (ST7789_FRCTRL2, [0x13]),
-            (0xD6, [0xA1]),
-            (0xD0, [0xA4, 0xA1]),
-            (ST7789_GMCTRP1, [0xF0, 0x08, 0x0E, 0x09, 0x08, 0x04, 0x2F, 0x33, 0x45, 0x36, 0x13, 0x12, 0x2A, 0x2D]),
-            (ST7789_GMCTRN1, [0xF0, 0x0E, 0x12, 0x0C, 0x0A, 0x15, 0x2E, 0x32, 0x44, 0x39, 0x17, 0x18, 0x2B, 0x2F]),
-            (0xE4, [0x1D, 0x00, 0x00])
         ]
 
         for cmd, cmd_data in init_sequence:
