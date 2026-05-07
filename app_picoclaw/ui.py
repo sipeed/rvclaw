@@ -1,8 +1,6 @@
 import asyncio
-import fcntl
 import math
-import socket
-import struct
+import psutil
 
 from maix import app, image
 
@@ -145,14 +143,11 @@ async def show_error(disp, message: str = "No response", duration: float = 2.0):
 def show_info_screen(disp, wifi_speed: str | None = None) -> None:
     def _get_ip() -> str | None:
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            ip = socket.inet_ntoa(fcntl.ioctl(
-                s.fileno(),
-                0x8915,  # SIOCGIFADDR
-                struct.pack('256s', b'wlan0'),
-            )[20:24])
-            s.close()
-            return ip
+            addrs = psutil.net_if_addrs().get('wlan0', [])
+            for addr in addrs:
+                if addr.family == 2:
+                    return addr.address
+            return None
         except Exception:
             return None
 
@@ -371,19 +366,59 @@ def _render_frame(question: str, window: list, tool_names: list | None = None) -
     return img
 
 
-async def show_result(disp, question: str, answer: str, tool_names: list | None = None, line_delay: float = 0.3, page_pause: float = 1.2):
-    ans = _strip_emoji(answer) if answer else "(no response)"
-
+def render_streaming_frame(disp, question: str, answer: str, tool_names: list | None = None):
+    ans = _strip_emoji(answer) if answer else ""
     q_lines, _ = _wrap(question, 2)
     y_est = 6 + LINE_H + len(q_lines) * LINE_H + 3 + 1 + 8 + LINE_H
     max_visible = max(1, (DISP_H - y_est - 4) // LINE_H)
+    all_lines, _ = _wrap(ans) if ans else ([], False)
+    window = all_lines[-max_visible:] if all_lines else []
+    disp.display(_render_frame(question, window, tool_names))
 
-    all_lines, _ = _wrap(ans)
 
-    for i in range(len(all_lines)):
-        start_idx = max(0, i + 1 - max_visible)
-        window = all_lines[start_idx:i + 1]
-        frame = _render_frame(question, window, tool_names)
-        disp.display(frame)
-        if i < len(all_lines) - 1:
-            await asyncio.sleep(line_delay)
+class StreamingRenderer:
+    def __init__(self, disp, question: str, line_delay: float = 0.8):
+        self.disp = disp
+        self.question = question
+        self.line_delay = line_delay
+        self._revealed = 0  # number of answer lines already shown
+        self._last_lines: list[str] = []
+        self._last_tools: list[str] | None = None
+        q_lines, _ = _wrap(question, 2)
+        y_est = 6 + LINE_H + len(q_lines) * LINE_H + 3 + 1 + 8 + LINE_H
+        self._max_visible = max(1, (DISP_H - y_est - 4) // LINE_H)
+
+    def _window(self, count: int) -> list[str]:
+        end = min(count, len(self._last_lines))
+        start = max(0, end - self._max_visible)
+        return self._last_lines[start:end]
+
+    def _draw(self, count: int, tool_names: list | None):
+        frame = _render_frame(self.question, self._window(count), tool_names)
+        self.disp.display(frame)
+
+    async def update(self, answer: str, tool_names: list | None = None):
+        ans = _strip_emoji(answer) if answer else ""
+        all_lines, _ = _wrap(ans) if ans else ([], False)
+        self._last_lines = all_lines
+        self._last_tools = tool_names
+
+        total = len(all_lines)
+        if total == 0:
+            self._revealed = 0
+            self._draw(0, tool_names)
+            return
+
+        complete = total - 1
+
+        while self._revealed < complete:
+            self._revealed += 1
+            self._draw(self._revealed + 1, tool_names)
+            await asyncio.sleep(self.line_delay)
+
+        self._draw(self._revealed + 1, tool_names)
+
+    async def finalize(self, tool_names: list | None = None):
+        if self._last_lines:
+            self._revealed = len(self._last_lines)
+        self._draw(self._revealed, tool_names if tool_names is not None else self._last_tools)

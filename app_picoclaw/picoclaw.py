@@ -7,8 +7,9 @@ import socket
 import subprocess
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
+from typing import AsyncIterator
 
 import websockets
 
@@ -17,20 +18,9 @@ logger = logging.getLogger(__name__)
 GATEWAY_HOST = "127.0.0.1"
 GATEWAY_PORT = 18790
 SECURITY_YML_PATH = Path(os.environ.get("PICOCLAW_SECURITY_YML", "/root/.picoclaw/.security.yml"))
-PID_FILE_PATH = Path(os.environ.get("PICOCLAW_PID_FILE", "/root/.picoclaw/.picoclaw.pid"))
 
 
-def _load_pid_token() -> str:
-    try:
-        if not PID_FILE_PATH.exists():
-            return ""
-        data = json.loads(PID_FILE_PATH.read_text(encoding="utf-8"))
-        return str(data.get("token", "")).strip()
-    except Exception:
-        return ""
-
-
-def _load_pico_token_from_yml() -> str:
+def _load_pico_token() -> str:
     env_token = os.environ.get("PICO_TOKEN", "").strip()
     if env_token:
         return env_token
@@ -52,11 +42,11 @@ def _load_pico_token_from_yml() -> str:
             indent = len(line) - len(line.lstrip(" "))
 
             if not in_channels:
-                if indent == 0 and stripped == "channels:":
+                if indent == 0 and stripped in ("channels:", "channel_list:"):
                     in_channels = True
                 continue
 
-            if in_channels and indent == 0 and stripped != "channels:":
+            if in_channels and indent == 0:
                 break
 
             if not in_pico:
@@ -77,14 +67,6 @@ def _load_pico_token_from_yml() -> str:
     return ""
 
 
-def _load_pico_token() -> str:
-    pid_token = _load_pid_token()
-    pico_token = _load_pico_token_from_yml()
-    if not pid_token and not pico_token:
-        return ""
-    return f"pico-{pid_token}{pico_token}"
-
-
 @dataclass
 class ToolCall:
     name: str
@@ -92,12 +74,17 @@ class ToolCall:
 
 
 @dataclass
-class PicoResponse:
-    tool_calls: list[ToolCall] = field(default_factory=list)
-    text: str = ""
+class PicoEvent:
+    kind: str
+    content: str = ""
+    delta: str = ""
+    message_id: str = ""
+    tool: ToolCall | None = None
+    error_code: str = ""
+    error_message: str = ""
+    raw: dict | None = None
 
 
-# Parse tool call format: 🔧 `tool_name`\n```\nargs\n```
 _TOOL_RE = re.compile(r'^🔧\s*`([^`]+)`\s*\n```\n(.*?)\n```\s*$', re.DOTALL)
 
 
@@ -108,7 +95,20 @@ def _parse_message(content: str) -> ToolCall | None:
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def _parse_tool_calls_payload(raw) -> ToolCall | None:
+    if not isinstance(raw, list):
+        return None
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        fn = item.get("function") if isinstance(item.get("function"), dict) else None
+        if not fn:
+            continue
+        name = fn.get("name") if isinstance(fn.get("name"), str) else ""
+        args = fn.get("arguments") if isinstance(fn.get("arguments"), str) else ""
+        if name:
+            return ToolCall(name=name, args=args or "")
+    return None
 
 
 class PicoclawAgent:
@@ -117,11 +117,11 @@ class PicoclawAgent:
         host: str = GATEWAY_HOST,
         port: int = GATEWAY_PORT,
         token: str | None = None,
-        timeout: float = 120.0,
+        idle_timeout: float = 0.0,
     ):
         self.ws_base   = f"ws://{host}:{port}/pico/ws"
         self._token    = token
-        self.timeout   = timeout
+        self._idle_timeout = idle_timeout
         self._ws       = None
         self._session_id = None
         self._lock     = asyncio.Lock()
@@ -132,37 +132,76 @@ class PicoclawAgent:
             return self._token
         return _load_pico_token()
 
+    @staticmethod
+    def _ws_open(ws) -> bool:
+        if ws is None:
+            return False
+        closed = getattr(ws, "closed", None)
+        if closed is not None:
+            return not closed
+        state = getattr(ws, "state", None)
+        if state is not None:
+            return getattr(state, "name", "") == "OPEN"
+        return True
+
     async def _ensure_connected(self):
-        if self._ws is not None and not self._ws.closed:
+        if self._ws_open(self._ws):
             return
         self._session_id = str(uuid.uuid4())
         url     = f"{self.ws_base}?session_id={self._session_id}"
         headers = {"Authorization": f"Bearer {self.token}"}
-        self._ws = await websockets.connect(url, extra_headers=headers)
-        logger.info("Connected session=%s", self._session_id)
+        try:
+            self._ws = await websockets.connect(url, additional_headers=headers)
+        except TypeError:
+            self._ws = await websockets.connect(url, extra_headers=headers)
+        logger.debug("Connected session=%s", self._session_id)
 
     async def close(self):
-        if self._ws and not self._ws.closed:
+        if self._ws_open(self._ws):
             await self._ws.close()
         self._ws = None
 
-    async def _do_ask(self, question: str, on_tool_call=None) -> PicoResponse:
-        ws         = self._ws
-        session_id = self._session_id
-        response   = PicoResponse()
+    async def astream(
+        self,
+        question: str,
+        idle_timeout: float | None = None,
+    ) -> AsyncIterator[PicoEvent]:
+        if idle_timeout is None:
+            idle_timeout = self._idle_timeout
 
-        logger.debug("Send: %s", question)
+        async with self._lock:
+            await self._ensure_connected()
+            ws = self._ws
+            session_id = self._session_id
 
-        await ws.send(json.dumps({
-            "type":       "message.send",
-            "id":         str(uuid.uuid4()),
-            "session_id": session_id,
-            "timestamp":  int(time.time() * 1000),
-            "payload":    {"content": question},
-        }, ensure_ascii=False))
+            logger.debug("Send: %s", question)
+            await ws.send(json.dumps({
+                "type":       "message.send",
+                "id":         str(uuid.uuid4()),
+                "session_id": session_id,
+                "timestamp":  int(time.time() * 1000),
+                "payload":    {"content": question},
+            }, ensure_ascii=False))
 
-        async def _recv_loop():
-            async for raw in ws:
+            last_answer_id: str | None = None
+            last_answer_content: str = ""
+
+            while True:
+                try:
+                    if idle_timeout and idle_timeout > 0:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=idle_timeout)
+                        except asyncio.TimeoutError:
+                            logger.debug("Stream idle for %ss, terminating turn.", idle_timeout)
+                            return
+                    else:
+                        raw = await ws.recv()
+                except websockets.ConnectionClosed as e:
+                    logger.debug("Pico WS closed (code=%s): %s",
+                                getattr(e, "code", "?"), e)
+                    self._ws = None
+                    return
+
                 try:
                     msg = json.loads(raw)
                 except Exception:
@@ -171,56 +210,82 @@ class PicoclawAgent:
                 ev_type = msg.get("type", "")
                 payload = msg.get("payload") or {}
 
+                if ev_type == "typing.start":
+                    yield PicoEvent(kind="typing_start", raw=msg)
+                    continue
+
+                if ev_type == "typing.stop":
+                    yield PicoEvent(kind="typing_stop", raw=msg)
+                    continue
+
+                if ev_type == "message.update":
+                    msg_id = payload.get("message_id") or ""
+                    if msg_id and msg_id == last_answer_id:
+                        new_content = payload.get("content", "") or ""
+                        delta = (
+                            new_content[len(last_answer_content):]
+                            if new_content.startswith(last_answer_content)
+                            else new_content
+                        )
+                        last_answer_content = new_content
+                        yield PicoEvent(
+                            kind="answer_delta",
+                            content=new_content,
+                            delta=delta,
+                            message_id=msg_id,
+                            raw=msg,
+                        )
+                    continue
+
+                if ev_type == "message.delete":
+                    if payload.get("message_id") == last_answer_id:
+                        last_answer_id = None
+                        last_answer_content = ""
+                    yield PicoEvent(kind="raw", raw=msg)
+                    continue
+
                 if ev_type == "message.create":
-                    content = payload.get("content", "")
-                    tool_call = _parse_message(content)
-                    if tool_call:
-                        response.tool_calls.append(tool_call)
-                        logger.debug("Tool: %s(%s)", tool_call.name, tool_call.args)
-                        if on_tool_call:
-                            await on_tool_call(tool_call)
-                    else:
-                        response.text = content.strip()
-                        logger.info("Response: %s%s", response.text[:80],
-                                     '...' if len(response.text) > 80 else '')
-                        break
+                    content = payload.get("content", "") or ""
+                    kind = (payload.get("kind") or "").strip().lower()
+                    is_thought = bool(payload.get("thought")) or kind == "thought"
+                    is_tool_calls = kind == "tool_calls"
 
-                elif ev_type == "error":
-                    logger.error("Error: %s – %s", payload.get('code'),
-                                 payload.get('message'))
-                    break
+                    tc = _parse_tool_calls_payload(payload.get("tool_calls"))
+                    if tc is None:
+                        tc = _parse_message(content)
+                    if tc or is_tool_calls:
+                        if tc is None:
+                            yield PicoEvent(kind="raw", raw=msg)
+                            continue
+                        yield PicoEvent(kind="tool_call", tool=tc, raw=msg)
+                        continue
 
-        await asyncio.wait_for(_recv_loop(), timeout=self.timeout)
-        return response
+                    if is_thought:
+                        yield PicoEvent(kind="thought", content=content, raw=msg)
+                        continue
 
-    async def ask(
-        self,
-        question: str,
-        on_tool_call=None,  # async callable(ToolCall)
-    ) -> PicoResponse:
-        async with self._lock:
-            for attempt in range(2):
-                try:
-                    await self._ensure_connected()
-                    return await self._do_ask(question, on_tool_call)
-                except asyncio.TimeoutError:
-                    logger.warning("Timeout (%ss)", self.timeout)
-                    return PicoResponse()
-                except (
-                    websockets.exceptions.ConnectionClosed,
-                    websockets.exceptions.ConnectionClosedError,
-                    OSError,
-                ) as e:
-                    logger.warning("Connection closed (%s): %s",
-                                   'reconnecting' if attempt == 0 else 'give up', e)
-                    self._ws = None
-                    if attempt > 0:
-                        return PicoResponse()
-                except Exception as e:
-                    logger.error("Exception: %s", e)
-                    self._ws = None
-                    return PicoResponse()
-        return PicoResponse()
+                    last_answer_id = payload.get("message_id") or ""
+                    last_answer_content = content
+                    yield PicoEvent(
+                        kind="answer_start",
+                        content=content,
+                        delta=content,
+                        message_id=last_answer_id,
+                        raw=msg,
+                    )
+                    continue
+
+                if ev_type == "error":
+                    yield PicoEvent(
+                        kind="error",
+                        error_code=str(payload.get("code", "")),
+                        error_message=str(payload.get("message", "")),
+                        raw=msg,
+                    )
+                    return
+
+                yield PicoEvent(kind="raw", raw=msg)
+
 
 
 def gateway_running(host: str = GATEWAY_HOST, port: int = GATEWAY_PORT) -> bool:
@@ -249,22 +314,45 @@ def get_picoclaw_model() -> str:
 
 
 if __name__ == "__main__":
+    import sys
     from config import setup_logging
     setup_logging()
 
     async def _test():
         agent = PicoclawAgent()
 
-        async def _on_tool(tc: ToolCall):
-            logger.info("Tool: %s args=%s", tc.name, tc.args)
-
         for q in ["Hello, introduce yourself.", "What's the weather in Shenzhen today?"]:
-            resp = await agent.ask(q, on_tool_call=_on_tool)
-            logger.info("=" * 60)
-            if resp.tool_calls:
-                logger.info("Tool calls: %s", ", ".join(tc.name for tc in resp.tool_calls))
-            logger.info("Answer:\n%s", resp.text)
-            logger.info("=" * 60)
+            logger.debug("=" * 60)
+            logger.debug("Q: %s", q)
+            sys.stdout.write("A (streaming): ")
+            sys.stdout.flush()
+
+            tool_calls: list[ToolCall] = []
+            fragments: list[str] = []
+
+            async for ev in agent.astream(q):
+                if ev.kind == "answer_start":
+                    if fragments:
+                        sys.stdout.write("\n\n")
+                    fragments.append(ev.content)
+                    sys.stdout.write(ev.delta)
+                elif ev.kind == "answer_delta" and fragments:
+                    fragments[-1] = ev.content
+                    sys.stdout.write(ev.delta)
+                elif ev.kind == "tool_call" and ev.tool:
+                    tool_calls.append(ev.tool)
+                    logger.debug("Tool: %s args=%s", ev.tool.name, ev.tool.args)
+                elif ev.kind == "error":
+                    logger.error("Error: %s – %s", ev.error_code, ev.error_message)
+                sys.stdout.flush()
+
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            full = "\n\n".join(s for s in (f.strip() for f in fragments) if s)
+            if tool_calls:
+                logger.debug("Tool calls: %s", ", ".join(tc.name for tc in tool_calls))
+            logger.debug("Final answer (%d chars):\n%s", len(full), full)
+            logger.debug("=" * 60)
             await asyncio.sleep(1)
         await agent.close()
 

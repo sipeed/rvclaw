@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 import subprocess
+import time
 
 import numpy as np
 from maix import audio, app, image
@@ -15,7 +16,7 @@ from config import (
     SPI_PORT, SPI_DC, SPI_RST, SPI_BACKLIGHT, SPI_SPEED_HZ, SPI_ROTATION,
     KEY_GPIO, BACK_KEY_GPIO, KEY_ACTIVE_LOW, KEY_DEBOUNCE_MS,
     FONT_PATH, FONT_NAME, FONT_SIZE, FONT_NAME_LARGE, FONT_SIZE_LARGE,
-    SAMPLE_RATE, AUDIO_CHANNELS, RECORDER_VOLUME, AGENT_TIMEOUT, TEST_MODE, IPERF_SERVER,
+    SAMPLE_RATE, AUDIO_CHANNELS, RECORDER_VOLUME, TEST_MODE, IPERF_SERVER,
 )
 
 logger = logging.getLogger(__name__)
@@ -23,7 +24,7 @@ from ui import (
     start_anim, stop_anim,
     show_no_speech, show_error, show_info_screen,
     animate_speak_now, animate_transcribing, animate_thinking,
-    show_result, show_home_icon, show_boot_choice, show_switching,
+    StreamingRenderer, show_home_icon, show_boot_choice, show_switching,
 )
 
 PICOCLAW_INIT = "/etc/init.d/S99picoclaw_app"
@@ -53,30 +54,40 @@ async def main():
     key = Key(gpio_num=KEY_GPIO, active_low=KEY_ACTIVE_LOW, debounce_ms=KEY_DEBOUNCE_MS)
     back_key = Key(gpio_num=BACK_KEY_GPIO, active_low=KEY_ACTIVE_LOW, debounce_ms=KEY_DEBOUNCE_MS)
 
-    show_boot_choice(disp)
     disp.set_backlight(1)
 
-    if not TEST_MODE:
+    async def _boot_choice_loop() -> str:
+        show_boot_choice(disp)
+        while (key.is_pressed() or back_key.is_pressed()) and not app.need_exit():
+            await asyncio.sleep(0.02)
         while not app.need_exit():
             if key.is_pressed():
                 while key.is_pressed() and not app.need_exit():
                     await asyncio.sleep(0.02)
-                break
+                return "picoclaw"
             if back_key.is_pressed():
                 while back_key.is_pressed() and not app.need_exit():
                     await asyncio.sleep(0.02)
-                show_switching(disp, "Entering Buddy...")
-                _spawn_switch_to_buddy()
-                try:
-                    await asyncio.sleep(30)
-                except asyncio.CancelledError:
-                    pass
-                led.close()
-                key.close()
-                back_key.close()
-                disp.turn_off()
-                return
+                return "buddy"
             await asyncio.sleep(0.05)
+        return "picoclaw"
+
+    async def _switch_to_buddy_and_exit() -> None:
+        show_switching(disp, "Entering Buddy...")
+        _spawn_switch_to_buddy()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            pass
+
+    if not TEST_MODE:
+        if await _boot_choice_loop() == "buddy":
+            await _switch_to_buddy_and_exit()
+            led.close()
+            key.close()
+            back_key.close()
+            disp.turn_off()
+            return
 
     show_home_icon(disp)
 
@@ -89,7 +100,7 @@ async def main():
         player = audio.Player(sample_rate=SAMPLE_RATE, channel=AUDIO_CHANNELS, block=True)
         player.volume(RECORDER_VOLUME)
 
-    agent = PicoclawAgent(timeout=AGENT_TIMEOUT)
+    agent = PicoclawAgent()
     _asr_fn = asr_session
 
     async def record_audio_until_release() -> np.ndarray | None:
@@ -147,7 +158,7 @@ async def main():
         start_anim(animate_transcribing(disp))
         try:
             result = await _asr_fn(pcm_all)
-            logger.info("Transcription: %s", result) if result else logger.info("No speech recognized")
+            logger.debug("Transcription: %s", result) if result else logger.debug("No speech recognized")
             return result or ""
         except asyncio.CancelledError:
             raise
@@ -184,61 +195,84 @@ async def main():
             stop_anim()
             led.stop_blink()
 
-    async def ask_agent_with_interrupt(text: str) -> tuple[str | None, list[str], bool]:
+    async def stream_agent_until_interrupt(text: str) -> tuple[str, list[str], bool]:
         logger.debug("Asking PicoClaw...")
-        tool_names = []
-
-        async def _on_tool(tc):
-            tool_names.append(tc.name)
+        tool_names: list[str] = []
+        fragments: list[str] = []
+        answer_started = False
+        interrupted = False
 
         led.start_blink()
         start_anim(animate_thinking(disp, tool_names))
-        answer = None
-        interrupted = False
 
-        ask_task = None
-        interrupt_task = None
+        renderer = StreamingRenderer(disp, text)
+
+        def current_answer() -> str:
+            return "\n\n".join(s for s in (f.strip() for f in fragments) if s)
+
+        async def render():
+            await renderer.update(current_answer(), tool_names)
+
+        async def consume_stream():
+            nonlocal answer_started
+            async for ev in agent.astream(text):
+                if ev.kind == "answer_start":
+                    if not answer_started:
+                        # Switch from thinking animation to live render.
+                        stop_anim()
+                        answer_started = True
+                    fragments.append(ev.content)
+                    await render()
+                elif ev.kind == "answer_delta" and fragments:
+                    fragments[-1] = ev.content
+                    if answer_started:
+                        await render()
+                elif ev.kind == "tool_call" and ev.tool:
+                    tool_names.append(ev.tool.name)
+                    if answer_started:
+                        await render()
+                elif ev.kind == "error":
+                    logger.error("PicoClaw error: %s – %s",
+                                 ev.error_code, ev.error_message)
+
+        async def wait_key_interrupt():
+            while not key.is_pressed() and not app.need_exit():
+                await asyncio.sleep(0.05)
+
+        stream_task = asyncio.create_task(consume_stream())
+        interrupt_task = asyncio.create_task(wait_key_interrupt())
         try:
-            ask_task = asyncio.create_task(agent.ask(text, on_tool_call=_on_tool))
-
-            async def wait_key_interrupt():
-                while not key.is_pressed() and not app.need_exit():
-                    await asyncio.sleep(0.05)
-
-            interrupt_task = asyncio.create_task(wait_key_interrupt())
-
             done, pending = await asyncio.wait(
-                [ask_task, interrupt_task],
-                return_when=asyncio.FIRST_COMPLETED
+                [stream_task, interrupt_task],
+                return_when=asyncio.FIRST_COMPLETED,
             )
-
-            for task in pending:
-                task.cancel()
-
-            if interrupt_task in done:
-                ask_task.cancel()
-                stop_anim()
-                logger.info("PicoClaw interrupted, ready for next input")
+            for t in pending:
+                t.cancel()
                 try:
-                    await ask_task
-                except asyncio.CancelledError:
+                    await t
+                except (asyncio.CancelledError, Exception):
                     pass
-                interrupted = True
-            else:
-                response = await ask_task
-                answer = response.text if response else None
-                logger.info("PicoClaw response: %s", answer) if answer else logger.warning("PicoClaw returned no content")
-        except Exception as e:
-            logger.error("PicoClaw error: %s", e)
-        finally:
-            if ask_task and not ask_task.done():
-                ask_task.cancel()
-            if interrupt_task and not interrupt_task.done():
-                interrupt_task.cancel()
 
-        stop_anim()
-        led.stop_blink()
-        return answer, tool_names, interrupted
+            if interrupt_task in done and not stream_task.done():
+                interrupted = True
+                logger.debug("PicoClaw interrupted, ready for next input")
+                try:
+                    await agent.close()
+                except Exception as e:
+                    logger.debug("agent.close on interrupt: %s", e)
+        except Exception as e:
+            logger.error("PicoClaw streaming error: %s", e)
+        finally:
+            if not stream_task.done():
+                stream_task.cancel()
+            if not interrupt_task.done():
+                interrupt_task.cancel()
+            if not answer_started:
+                stop_anim()
+            led.stop_blink()
+
+        return current_answer(), tool_names, interrupted
+
 
     async def _active_cycle():
         """Run one complete voice interaction cycle."""
@@ -263,13 +297,13 @@ async def main():
                 await show_no_speech(disp)
                 return
 
-            answer, tool_names, interrupted = await ask_agent_with_interrupt(result)
+            answer, _tool_names, interrupted = await stream_agent_until_interrupt(result)
             if interrupted:
                 return
 
             if answer:
                 led.set_on()
-                await show_result(disp, result, answer, tool_names=tool_names)
+                logger.debug("PicoClaw response: %s", answer)
             else:
                 led.set_off()
                 await show_error(disp, "No response")
@@ -278,8 +312,14 @@ async def main():
                 await asyncio.sleep(0.05)
 
         finally:
-            stop_anim()
-            led.set_off()
+            try:
+                stop_anim()
+            except Exception:
+                pass
+            try:
+                led.set_off()
+            except (ValueError, OSError):
+                pass
 
     async def _watch_back():
         while not back_key.is_pressed() and not app.need_exit():
@@ -317,9 +357,30 @@ async def main():
 
         return "parse failed"
 
+    BACK_LONG_PRESS_S = 2.0
+
     try:
         while not app.need_exit():
             if back_key.is_pressed():
+                hold_start = time.monotonic()
+                long_press = False
+                if not TEST_MODE:
+                    while back_key.is_pressed() and not app.need_exit():
+                        if time.monotonic() - hold_start >= BACK_LONG_PRESS_S:
+                            long_press = True
+                            break
+                        await asyncio.sleep(0.02)
+
+                if long_press:
+                    while back_key.is_pressed() and not app.need_exit():
+                        await asyncio.sleep(0.02)
+                    choice = await _boot_choice_loop()
+                    if choice == "buddy":
+                        await _switch_to_buddy_and_exit()
+                        return
+                    show_home_icon(disp)
+                    continue
+
                 speed_text = None
                 speed_task = None
                 speed_updated = False
@@ -330,9 +391,6 @@ async def main():
                     speed_task = asyncio.create_task(_run_wifi_speed_test())
                 else:
                     show_info_screen(disp)
-
-                while back_key.is_pressed() and not app.need_exit():
-                    await asyncio.sleep(0.02)
 
                 while not back_key.is_pressed() and not app.need_exit():
                     if speed_task and speed_task.done() and not speed_updated:
